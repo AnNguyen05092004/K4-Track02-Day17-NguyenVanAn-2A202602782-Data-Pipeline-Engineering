@@ -1,31 +1,37 @@
 """Central config. Everything runs locally on DuckDB — no API keys, no cloud."""
+
 from __future__ import annotations
 
 from datetime import date, timedelta
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
-DATA_DIR = ROOT / "data"            # what the source systems deliver, one file per day
-LAKE_DIR = ROOT / "lake"            # stand-in for S3 / GCS
-BRONZE_DIR = LAKE_DIR / "bronze"    # Bronze = immutable Parquet, one file per (source, day)
-WAREHOUSE = ROOT / "warehouse.duckdb"   # Silver + Gold live here
+DATA_DIR = ROOT / "data"  # what the source systems deliver, one file per day
+LAKE_DIR = ROOT / "lake"  # stand-in for S3 / GCS
+BRONZE_DIR = (
+    LAKE_DIR / "bronze"
+)  # Bronze = immutable Parquet, one file per (source, day)
+WAREHOUSE = ROOT / "warehouse.duckdb"  # Silver + Gold live here
 SUBMISSION_DIR = ROOT / "submission"
 
 FIRST_DAY = "2026-08-10"
 LAST_DAY = "2026-08-16"
-RERUN_DAY = "2026-08-12"            # the "old day" the grader re-runs three times
+RERUN_DAY = "2026-08-12"  # the "old day" the grader re-runs three times
 
 # raw file per source per ingest day (what Kafka Connect / the exporter wrote)
 SOURCES = {
-    "tickets": "cdc/tickets/{day}.jsonl",      # Debezium CDC (Postgres), via Kafka
-    "events": "events/{day}.jsonl",            # Kafka topic support.events
-    "transcripts": "transcripts/{day}.json",   # hourly S3 dumps, merged per day
+    "tickets": "cdc/tickets/{day}.jsonl",  # Debezium CDC (Postgres), via Kafka
+    "events": "events/{day}.jsonl",  # Kafka topic support.events
+    "transcripts": "transcripts/{day}.json",  # hourly S3 dumps, merged per day
 }
 
 # How many days back every daily run recomputes gold_feature_daily.
-# Events are produced by our own apps and reach Kafka within seconds, so each
-# run only needs to recompute its own day.
-LOOKBACK_DAYS = 0
+# Set from the P99 of (_ingested_at - event_time) MEASURED from Bronze
+# (`python main.py --lateness` -> p99 = 3.00 days), so lookback = ceil(p99) = 3.
+# Events can arrive days late (offline clients), so each run recomputes the
+# last 3 days as well as its own day.
+LOOKBACK_DAYS = 3
+
 
 EMBEDDING_MODEL_VERSION = "hash-embed-v1"
 CHUNK_WORDS = 40

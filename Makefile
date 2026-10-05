@@ -3,7 +3,7 @@
 
 VENV ?= .venv
 PY   := $(VENV)/bin/python
-DBT  := $(abspath $(VENV))/bin/dbt
+DBT  := "$(abspath $(VENV))/bin/dbt"
 DAY  ?= 2026-08-12
 export DO_NOT_TRACK := 1
 

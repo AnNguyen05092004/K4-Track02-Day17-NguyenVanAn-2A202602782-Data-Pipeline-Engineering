@@ -14,6 +14,7 @@ Kafka log compaction can forget the key. Tombstones carry no change.
 Timestamps in `after` use Debezium's default for Postgres TIMESTAMP:
 microseconds since epoch (io.debezium.time.MicroTimestamp).
 """
+
 from __future__ import annotations
 
 from .bronze import bronze_scan
@@ -37,7 +38,8 @@ def ticket_changes_sql(upto: str | None = None, batch: str | None = None) -> str
     return f"""
     SELECT * FROM (
         SELECT
-            j->'value'->'after'->>'ticket_id'                       AS ticket_id,
+            coalesce(j->'value'->'after'->>'ticket_id',
+                     j->'value'->'before'->>'ticket_id')            AS ticket_id,
             _op,
             (j->'value'->'source'->>'lsn')::BIGINT                  AS _lsn,
             make_timestamp((j->'value'->'source'->>'ts_ms')::BIGINT * 1000) AS _changed_at,

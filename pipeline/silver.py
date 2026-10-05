@@ -9,6 +9,7 @@ Every daily run feeds ONLY that day's Bronze batch into these tables, so every
 write here must be idempotent: run a day once or ten times, re-run an old day
 after newer days — the end state must be the same.
 """
+
 from __future__ import annotations
 
 import json
@@ -17,7 +18,9 @@ import duckdb
 
 from .quality import validate_events
 from .staging import (
-    event_records_sql, ticket_changes_sql, transcript_records_sql,
+    event_records_sql,
+    ticket_changes_sql,
+    transcript_records_sql,
 )
 
 # PII masking used for every free-text column that leaves Bronze.
@@ -61,10 +64,12 @@ def ensure_tables(con: duckdb.DuckDBPyConnection) -> None:
 
 # ── tickets ─────────────────────────────────────────────────────────────────
 
+
 def upsert_silver_tickets(con: duckdb.DuckDBPyConnection, day: str) -> dict:
     """Apply one day's CDC batch to silver_tickets."""
     # Within one batch a ticket can change several times (and Kafka may deliver
     # the same change twice): keep only its latest change, by LSN.
+    # => dedup trong một ngày
     con.execute(f"""
         CREATE OR REPLACE TEMP TABLE _latest_changes AS
         SELECT ticket_id, user_id,
@@ -76,13 +81,25 @@ def upsert_silver_tickets(con: duckdb.DuckDBPyConnection, day: str) -> dict:
     """)
     (n_changes,) = con.execute("SELECT count(*) FROM _latest_changes").fetchone()
 
-    # Write this batch's changes to Silver.
+    # Upsert this batch into Silver, keyed on ticket_id.
+    #  - ticket not in Silver yet            -> INSERT
+    #  - ticket exists AND batch is newer    -> UPDATE (higher _lsn wins)
+    #  - ticket exists AND batch is older    -> do nothing (old batch must not
+    #                                           overwrite a newer state)
     # A delete arrives as a change with is_deleted = true and every PII column null.
+    # => upsert giữa các ngày.
     con.execute("""
-        INSERT INTO silver_tickets
-        SELECT ticket_id, user_id, subject, body, priority, status, category,
-               created_at, updated_at, is_deleted, _lsn, _batch_id
-        FROM _latest_changes
+        MERGE INTO silver_tickets AS t
+        USING _latest_changes AS s
+        ON t.ticket_id = s.ticket_id
+        WHEN MATCHED AND s._lsn > t._lsn THEN UPDATE SET
+            user_id = s.user_id, subject = s.subject, body = s.body,
+            priority = s.priority, status = s.status, category = s.category,
+            created_at = s.created_at, updated_at = s.updated_at,
+            is_deleted = s.is_deleted, _lsn = s._lsn, _batch_id = s._batch_id
+        WHEN NOT MATCHED THEN INSERT VALUES (
+            s.ticket_id, s.user_id, s.subject, s.body, s.priority, s.status,
+            s.category, s.created_at, s.updated_at, s.is_deleted, s._lsn, s._batch_id)
     """)
     (n_rows,) = con.execute("SELECT count(*) FROM silver_tickets").fetchone()
     return {"changes_in_batch": n_changes, "silver_rows": n_rows}
@@ -111,6 +128,7 @@ def build_ticket_history(con: duckdb.DuckDBPyConnection) -> int:
 
 # ── events ──────────────────────────────────────────────────────────────────
 
+
 def upsert_silver_events(con: duckdb.DuckDBPyConnection, day: str) -> dict:
     records = con.execute(event_records_sql(day)).fetchall()
     valid, bad = validate_events(records)
@@ -120,8 +138,18 @@ def upsert_silver_events(con: duckdb.DuckDBPyConnection, day: str) -> dict:
     if bad:
         con.executemany(
             "INSERT INTO quarantine_events VALUES (?, ?, ?, ?, ?, ?)",
-            [(b["_batch_id"], b["_kafka_partition"], b["_kafka_offset"], b["event_id"],
-              b["reason"], b["_payload"]) for b in bad])
+            [
+                (
+                    b["_batch_id"],
+                    b["_kafka_partition"],
+                    b["_kafka_offset"],
+                    b["event_id"],
+                    b["reason"],
+                    b["_payload"],
+                )
+                for b in bad
+            ],
+        )
 
     con.execute("""CREATE OR REPLACE TEMP TABLE _events_in (
         event_id VARCHAR, user_id VARCHAR, ticket_id VARCHAR, type VARCHAR, rating VARCHAR,
@@ -130,9 +158,23 @@ def upsert_silver_events(con: duckdb.DuckDBPyConnection, day: str) -> dict:
     if valid:
         con.executemany(
             "INSERT INTO _events_in VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
-            [(v["event_id"], v["user_id"], v["ticket_id"], v["type"], v["rating"], v["page"],
-              v["event_time"], v["_ingested_at"], v["_batch_id"], v["_kafka_partition"],
-              v["_kafka_offset"]) for v in valid])
+            [
+                (
+                    v["event_id"],
+                    v["user_id"],
+                    v["ticket_id"],
+                    v["type"],
+                    v["rating"],
+                    v["page"],
+                    v["event_time"],
+                    v["_ingested_at"],
+                    v["_batch_id"],
+                    v["_kafka_partition"],
+                    v["_kafka_offset"],
+                )
+                for v in valid
+            ],
+        )
     # Events are immutable facts: insert the ones we have never seen, ignore redeliveries.
     con.execute("""
         MERGE INTO silver_events AS t
@@ -147,15 +189,22 @@ def upsert_silver_events(con: duckdb.DuckDBPyConnection, day: str) -> dict:
             s.event_time, s._ingested_at, s._batch_id)
     """)
     (n_rows,) = con.execute("SELECT count(*) FROM silver_events").fetchone()
-    return {"records_in_batch": len(records), "valid": len(valid),
-            "quarantined": len(bad), "silver_rows": n_rows}
+    return {
+        "records_in_batch": len(records),
+        "valid": len(valid),
+        "quarantined": len(bad),
+        "silver_rows": n_rows,
+    }
 
 
 # ── transcripts ─────────────────────────────────────────────────────────────
 
+
 def upsert_silver_transcripts(con: duckdb.DuckDBPyConnection, day: str) -> dict:
     rows = []
-    for payload, ingested_at, batch_id in con.execute(transcript_records_sql(day)).fetchall():
+    for payload, ingested_at, batch_id in con.execute(
+        transcript_records_sql(day)
+    ).fetchall():
         obj = json.loads(payload)
         text = "\n".join(f"{t['role']}: {t['text']}" for t in obj["turns"])
         rows.append((obj["ticket_id"], ingested_at, len(obj["turns"]), text, batch_id))
